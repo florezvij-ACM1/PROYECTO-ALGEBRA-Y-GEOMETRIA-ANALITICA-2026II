@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Simulador hídrico · Santa Marta</title>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;600;800&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+ body{margin:0;font-family:'Bricolage Grotesque',system-ui,sans-serif;font-variant-numeric:tabular-nums;background:#0a2a38;color:#e6f4f8}
+ #c{position:fixed;inset:0;cursor:grab}#c:active{cursor:grabbing}
+ .pn{background:rgba(6,30,42,.84);border:1px solid #1f5468;border-radius:10px;backdrop-filter:blur(6px)}
+ input[type=range]{width:100%;accent-color:#5ad1e6}
+ input[type=number]{background:#06222f;border:1px solid #1f5468;border-radius:6px;padding:4px 8px;width:100%;color:#e6f4f8}
+ .eq{background:#06222f;border-left:3px solid #5ad1e6;padding:6px 8px;font-size:12.5px;border-radius:0 6px 6px 0;margin-top:4px}
+ button:focus-visible,input:focus-visible{outline:2px solid #ffd166;outline-offset:2px}
+ h2{font-weight:600;font-size:13px;color:#8fd8e8;margin:12px 0 2px}
+</style>
+</head>
+<body>
+<div id="c"></div>
+<div class="fixed inset-0 pointer-events-none flex flex-col md:flex-row justify-between gap-3 p-3">
+ <aside class="pn pointer-events-auto md:w-80 p-4 overflow-auto max-h-[42vh] md:max-h-full">
+  <h1 class="text-xl font-extrabold leading-tight">Acueducto de Santa Marta</h1>
+  <p class="text-xs text-cyan-200/70">Planta Mamatoco / El Roble · arrastra para girar, rueda para acercar</p>
+  <h2>Falla en planta: <b id="vf">0</b>%</h2>
+  <input id="f" type="range" min="0" max="100" value="0" aria-label="Falla en planta">
+  <h2>Factor de sequía: <b id="vs">0</b>%</h2>
+  <input id="s" type="range" min="0" max="100" value="0" aria-label="Factor de sequía">
+  <div class="grid grid-cols-2 gap-2 mt-3">
+   <label class="text-xs">Q₁ río Piedras (L/s)<input id="q1" type="number" step="0.01" min="0" value="125.45"></label>
+   <label class="text-xs">Q₂ río Manzanares (L/s)<input id="q2" type="number" step="0.01" min="0" value="98.30"></label>
+  </div>
+  <h2>Válvulas por sector</h2>
+  <div id="vv" class="grid grid-cols-2 gap-2"></div>
+  <button id="em" class="mt-4 w-full rounded-lg py-2 font-semibold bg-orange-500 hover:bg-orange-400 text-slate-950">Abrir compuerta de emergencia</button>
+  <p id="st" class="mt-3 text-sm"></p>
+ </aside>
+ <aside class="pn pointer-events-auto md:w-96 p-4 overflow-auto max-h-[42vh] md:max-h-full text-sm">
+  <h2 style="margin-top:0">Caudales</h2><div id="m1"></div>
+  <h2>Ecuaciones lineales</h2><div id="m2"></div>
+  <h2>Canal rectangular (cuadrática)</h2><div id="m3"></div>
+  <canvas id="cv" width="320" height="110" class="w-full mt-1 rounded bg-[#06222f]"></canvas>
+  <h2>Chorro de purga</h2><div id="m4"></div>
+  <h2>Continuidad y presión</h2><div id="m5"></div>
+ </aside>
+</div>
+
+<script>
+/* ===== 1. LÓGICA MATEMÁTICA (unidades: L/s, m, m³, kPa, COP) ===== */
+const HID={
+  Q1:125.45, Q2:98.30, COTA_CAPTACION:850.50, COTA_PLANTA:28.40, RHO:997, G:9.81, PM:6.0, H0:3.0,
+  hf:Q=>0.045*Q+1.25,                       // pérdida de carga [m]
+  costo:V=>V*850.50+150000,                 // costo mensual de bombeo [COP], V en m³
+  vol:(r,h)=>Math.PI*r*r*h,                 // tanque cilíndrico [m³]
+  area:(x,Pm=HID.PM)=>-2*x*x+Pm*x,          // x = tirante; base b = Pm − 2x
+  xOpt:(Pm=HID.PM)=>Pm/4,                   // vértice: −b/2a
+  aMax:(Pm=HID.PM)=>Pm*Pm/8,                // A(x_opt)
+  chorro:(x,H0=HID.H0)=>H0-0.18*x*x,        // trayectoria parabólica
+  alcance:(H0=HID.H0)=>Math.sqrt(H0/0.18),  // raíz positiva de y(x)=0
+  continuidad:(V,Qin,Qout,dt)=>V+(Qin-Qout)/1000*dt, // L/s → m³/s; dt en s
+  presion:h=>HID.RHO*HID.G*h/1000           // P = ρ g h [kPa]
+};
+const R_T=6.0,H_T=8.0,VMAX=HID.vol(R_T,H_T),DEMANDA=180,ACEL=300;
+const S={falla:0,seq:0,q1:HID.Q1,q2:HID.Q2,emerg:false};
+const TK=[
+ {n:'Centro / Norte',s:.30,x:-4,z:4},{n:'Pescaíto / Bastidas',s:.20,x:4,z:6},
+ {n:'Mamatoco / Curval',s:.22,x:12,z:6},{n:'Gaira / Rodadero',s:.28,x:20,z:4}
+].map(k=>({...k,open:true,V:VMAX*.6,qin:0,qout:0}));
+
+function step(dt){
+  const sdt=dt*ACEL, qdisp=(S.q1+S.q2)*(1-S.seq/100), qplanta=qdisp*(1-S.falla/100);
+  const qpurga=S.emerg?Math.min(60,qplanta*.35):0, qneto=qplanta-qpurga;
+  const so=TK.reduce((a,k)=>a+(k.open?k.s:0),0);
+  TK.forEach(k=>{
+    k.qin=(k.open&&so>0&&k.V<VMAX)?qneto*k.s/so:0;
+    k.qout=k.V>0?DEMANDA*k.s:0;
+    k.V=Math.min(VMAX,Math.max(0,HID.continuidad(k.V,k.qin,k.qout,sdt)));
+  });
+  return {qdisp,qplanta,qpurga,qneto};
+}
+
+/* ===== 2. ESCENA 3D ===== */
+const $=id=>document.getElementById(id);
+const fmt=(v,d=2)=>v.toLocaleString('es-CO',{minimumFractionDigits:d,maximumFractionDigits:d});
+const V3=(x,y,z)=>new THREE.Vector3(x,y,z);
+const renderer=new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+$('c').appendChild(renderer.domElement);
+const scene=new THREE.Scene();scene.background=new THREE.Color(0x86b9cf);scene.fog=new THREE.Fog(0x86b9cf,80,170);
+const camera=new THREE.PerspectiveCamera(50,1,.1,400);
+scene.add(new THREE.HemisphereLight(0xdff3ff,0x2b4a3a,.95));
+const sun=new THREE.DirectionalLight(0xfff1d6,1.1);sun.position.set(30,40,20);scene.add(sun);
+
+// Sierra Nevada: relieve por picos gaussianos + cumbres nevadas por altura
+const pk=[[-6,-34,27,9],[10,-37,29,8],[26,-31,19,8],[-26,-31,18,8],[42,-33,15,9],[-44,-34,14,9]];
+const hgt=(x,z)=>{let h=0;for(const[a,b,H,s]of pk)h+=H*Math.exp(-((x-a)**2+(z-b)**2)/(2*s*s));
+  const r=Math.min(1,Math.max(0,(-z-9)/16));
+  h+=r*(4+2.5*Math.sin(x*.21)*Math.cos(z*.3))+.25*r*Math.sin(x*.9)*Math.sin(z*.8);
+  if(z>7)h-=(z-7)*.35;return h;};
+const tg=new THREE.PlaneGeometry(130,60,130,60);tg.rotateX(-Math.PI/2);tg.translate(0,0,-10);
+const tp=tg.attributes.position,col=new Float32Array(tp.count*3),c=new THREE.Color();
+for(let i=0;i<tp.count;i++){const x=tp.getX(i),z=tp.getZ(i),h=hgt(x,z);tp.setY(i,h);
+  if(h>13)c.set(0xf5fbff);else if(h>9)c.set(0xf5fbff).lerp(new THREE.Color(0x77736a),(13-h)/4);
+  else if(h>3.5)c.set(0x6f6b60);else if(z>4.5)c.set(0xd8c48f);else c.set(0x3f6f4a);
+  col.set([c.r,c.g,c.b],i*3);}
+tg.setAttribute('color',new THREE.BufferAttribute(col,3));tg.computeVertexNormals();
+scene.add(new THREE.Mesh(tg,new THREE.MeshStandardMaterial({vertexColors:true,flatShading:true,roughness:1})));
+const sea=new THREE.Mesh(new THREE.PlaneGeometry(500,500).rotateX(-Math.PI/2),
+  new THREE.MeshStandardMaterial({color:0x1d7f99,transparent:true,opacity:.92,roughness:.3}));
+sea.position.y=-.8;scene.add(sea);
+
+// Planta de tratamiento Mamatoco / El Roble
+const PX=-16,PZ=-4,plant=new THREE.Group();plant.position.set(PX,0,PZ);scene.add(plant);
+const mat=c=>new THREE.MeshStandardMaterial({color:c,roughness:.7});
+const add=(g,m,x,y,z,p=plant)=>{const o=new THREE.Mesh(g,m);o.position.set(x,y,z);p.add(o);return o;};
+add(new THREE.BoxGeometry(8,3,5),mat(0xcfd8dc),0,1.5,0);
+add(new THREE.BoxGeometry(8.4,.3,5.4),mat(0x546e7a),0,3.1,0);
+[-2,2].forEach(x=>{add(new THREE.CylinderGeometry(1.6,1.6,.5,32),mat(0x9aa7ad),x,.25,-4);
+  add(new THREE.CylinderGeometry(1.45,1.45,.52,32),new THREE.MeshStandardMaterial({color:0x35b6d4}),x,.27,-4);});
+add(new THREE.CylinderGeometry(.4,.4,2.2,12),mat(0x78909c),3,4.3,-1);
+const gate=add(new THREE.BoxGeometry(1.4,.8,.5),new THREE.MeshStandardMaterial({color:0x7a8a92,emissive:0x000000}),0,3,2.5);
+const gateLight=new THREE.PointLight(0xff5a36,0,14);gateLight.position.set(PX,3.5,PZ+3);scene.add(gateLight);
+
+// Tanques, etiquetas, tuberías, válvulas y partículas
+const label=t=>{const k=document.createElement('canvas');k.width=320;k.height=64;const g=k.getContext('2d');
+  g.fillStyle='rgba(6,30,42,.85)';g.fillRect(0,0,320,64);g.fillStyle='#e6f4f8';g.font='600 28px sans-serif';
+  g.textAlign='center';g.textBaseline='middle';g.fillText(t,160,34);
+  const s=new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(k)}));s.scale.set(8,1.6,1);return s;};
+const TH=4.5,TR=1.9,NP=26,flows=[];
+TK.forEach((k,i)=>{
+  const g=new THREE.Group();g.position.set(k.x,0,k.z);scene.add(g);
+  add(new THREE.CylinderGeometry(TR,TR,TH,32,1,true),new THREE.MeshStandardMaterial({color:0xdfe8ec,transparent:true,opacity:.28,side:THREE.DoubleSide}),0,TH/2,0,g);
+  add(new THREE.CylinderGeometry(TR,TR,.15,32),mat(0x90a4ae),0,TH,0,g);
+  const wg=new THREE.CylinderGeometry(TR*.96,TR*.96,1,32);wg.translate(0,.5,0);
+  k.water=add(wg,new THREE.MeshStandardMaterial({color:0x2fb8d8,transparent:true,opacity:.85}),0,0,0,g);
+  const l=label(k.n);l.position.set(0,TH+1.3,0);g.add(l);
+  const S0=V3(PX+4.4,.7,PZ),E=V3(k.x,.7,k.z-TR-.1);
+  const cv=new THREE.CatmullRomCurve3([S0,V3((S0.x+E.x)/2,.7,(S0.z+E.z)/2+1.2+i*.8),E]);
+  k.pipe=new THREE.Mesh(new THREE.TubeGeometry(cv,48,.22,10),new THREE.MeshStandardMaterial({color:0x607d8b,emissive:0x000000}));scene.add(k.pipe);
+  k.valve=new THREE.Mesh(new THREE.SphereGeometry(.5,16,12),new THREE.MeshStandardMaterial({color:0x3ddc84}));
+  k.valve.position.copy(cv.getPointAt(.82)).setY(1.1);scene.add(k.valve);
+  const pg=new THREE.BufferGeometry();pg.setAttribute('position',new THREE.BufferAttribute(new Float32Array(NP*3),3));
+  const pts=new THREE.Points(pg,new THREE.PointsMaterial({color:0xaef6ff,size:.55,transparent:true,opacity:.95,depthWrite:false}));
+  pts.frustumCulled=false;scene.add(pts);flows.push({cv,pg,pts,ph:i*.2});
+});
+
+// Chorro parabólico y(x)=H0−0.18x² (x = distancia horizontal desde la compuerta)
+const JN=160,jit=Array.from({length:JN},()=>[(Math.random()-.5),Math.random()]);
+const jg=new THREE.BufferGeometry();jg.setAttribute('position',new THREE.BufferAttribute(new Float32Array(JN*3),3));
+const jet=new THREE.Points(jg,new THREE.PointsMaterial({color:0xd5fbff,size:.34,transparent:true,depthWrite:false}));jet.frustumCulled=false;jet.visible=false;scene.add(jet);
+const arc=[];for(let i=0;i<=40;i++){const s=HID.alcance()*i/40;arc.push(V3(PX,HID.chorro(s),PZ+2.8+s));}
+const jline=new THREE.Line(new THREE.BufferGeometry().setFromPoints(arc),new THREE.LineBasicMaterial({color:0xff9d5c}));jline.visible=false;scene.add(jline);
+const splash=new THREE.Mesh(new THREE.RingGeometry(.4,.7,24).rotateX(-Math.PI/2),new THREE.MeshBasicMaterial({color:0xd5fbff,transparent:true,opacity:.7}));
+splash.position.set(PX,.08,PZ+2.8+HID.alcance());splash.visible=false;scene.add(splash);
+
+// Cámara orbital
+let th=.12,ph=1.12,rad=50;const tgt=V3(2,4,-4);
+const cam=()=>{camera.position.set(tgt.x+rad*Math.sin(ph)*Math.sin(th),tgt.y+rad*Math.cos(ph),tgt.z+rad*Math.sin(ph)*Math.cos(th));camera.lookAt(tgt);};
+let drag=null;const el=renderer.domElement;
+el.addEventListener('pointerdown',e=>{drag=[e.clientX,e.clientY];el.setPointerCapture(e.pointerId);});
+el.addEventListener('pointerup',()=>drag=null);
+el.addEventListener('pointermove',e=>{if(!drag)return;th-=(e.clientX-drag[0])*.006;ph=Math.min(1.5,Math.max(.35,ph-(e.clientY-drag[1])*.005));drag=[e.clientX,e.clientY];});
+el.addEventListener('wheel',e=>{rad=Math.min(90,Math.max(18,rad+e.deltaY*.04));e.preventDefault();},{passive:false});
+const resize=()=>{renderer.setSize(innerWidth,innerHeight);camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();};
+addEventListener('resize',resize);resize();
+
+/* ===== 3. CONTROLES ===== */
+$('f').oninput=e=>{S.falla=+e.target.value;$('vf').textContent=S.falla;};
+$('s').oninput=e=>{S.seq=+e.target.value;$('vs').textContent=S.seq;};
+$('q1').oninput=e=>S.q1=Math.max(0,+e.target.value||0);
+$('q2').oninput=e=>S.q2=Math.max(0,+e.target.value||0);
+TK.forEach(k=>{const b=document.createElement('button');b.className='rounded-md px-2 py-1.5 text-xs text-left border';
+  b.onclick=()=>{k.open=!k.open;paint();};k.btn=b;$('vv').appendChild(b);});
+function paint(){TK.forEach(k=>{k.btn.textContent=(k.open?'Cerrar · ':'Abrir · ')+k.n;
+  k.btn.className='rounded-md px-2 py-1.5 text-xs text-left border '+(k.open?'border-emerald-400/60 bg-emerald-900/40':'border-red-400/70 bg-red-900/50');
+  k.valve.material.color.set(k.open?0x3ddc84:0xff5a5a);k.pipe.material.emissive.set(k.open?0x000000:0x661111);});
+  $('em').textContent=S.emerg?'Cerrar compuerta de emergencia':'Abrir compuerta de emergencia';}
+$('em').onclick=()=>{S.emerg=!S.emerg;jet.visible=jline.visible=splash.visible=S.emerg;paint();};
+paint();
+
+/* ===== 4. DASHBOARD ===== */
+function drawCanal(){const k=$('cv'),g=k.getContext('2d'),W=k.width,H=k.height,xm=3,ym=5;
+  g.clearRect(0,0,W,H);g.strokeStyle='#5ad1e6';g.lineWidth=2;g.beginPath();
+  for(let i=0;i<=60;i++){const x=xm*i/60,px=10+x/xm*(W-20),py=H-12-HID.area(x)/ym*(H-24);i?g.lineTo(px,py):g.moveTo(px,py);}g.stroke();
+  const ox=10+HID.xOpt()/xm*(W-20),oy=H-12-HID.aMax()/ym*(H-24);
+  g.fillStyle='#ffd166';g.beginPath();g.arc(ox,oy,5,0,7);g.fill();
+  g.fillStyle='#e6f4f8';g.font='11px sans-serif';g.fillText(`x=${fmt(HID.xOpt())} m · A=${fmt(HID.aMax())} m²`,ox+9,oy+4);}
+drawCanal();
+const row=(a,b)=>`<div class="flex justify-between"><span class="text-cyan-100/70">${a}</span><b>${b}</b></div>`;
+function ui(r){
+  const hf=HID.hf(r.qneto),Vm=r.qneto/1000*86400*30,C=HID.costo(Vm),xo=HID.xOpt(),Am=HID.aMax(),al=HID.alcance();
+  $('m1').innerHTML=row('Q₁ + Q₂ (ríos)',fmt(S.q1+S.q2)+' L/s')+row('Disponible con sequía',fmt(r.qdisp)+' L/s')
+    +row('Salida de planta',fmt(r.qplanta)+' L/s')+row('Purga de emergencia',fmt(r.qpurga)+' L/s')+row('Caudal neto a sectores',fmt(r.qneto)+' L/s');
+  $('m2').innerHTML=`<div class="eq">h<sub>f</sub>(Q) = 0.045·Q + 1.25<br>h<sub>f</sub>(${fmt(r.qneto)}) = <b>${fmt(hf)} m</b></div>
+   <div class="eq">C(V) = 850.50·V + 150 000<br>V = ${fmt(Vm,0)} m³/mes → <b>$${fmt(C,0)} COP</b></div>`
+   +row('Cota captación Sierra Nevada',fmt(HID.COTA_CAPTACION)+' m s.n.m.')+row('Carga disponible ΔH',fmt(HID.COTA_CAPTACION-HID.COTA_PLANTA-hf)+' m');
+  $('m3').innerHTML=`<div class="eq">A(x) = −2x² + ${fmt(HID.PM,1)}x &nbsp;(P<sub>m</sub> = ${fmt(HID.PM,1)} m)<br>x<sub>ópt</sub> = P<sub>m</sub>/4 = <b>${fmt(xo)} m</b> · b = ${fmt(HID.PM-2*xo)} m<br>A<sub>máx</sub> = A(${fmt(xo)}) = <b>${fmt(Am)} m²</b></div>`;
+  $('m4').innerHTML=`<div class="eq">y(x) = ${fmt(HID.H0,1)} − 0.18x²<br>alcance = √(${fmt(HID.H0,1)}/0.18) = <b>${fmt(al)} m</b>${S.emerg?'<br>Compuerta ABIERTA':''}</div>`;
+  const Vt=TK.reduce((a,k)=>a+k.V,0),k0=TK[0];
+  $('m5').innerHTML=`<div class="eq">V(t+Δt) = V(t) + (Q<sub>in</sub> − Q<sub>out</sub>)Δt<br>V<sub>total</sub> = <b>${fmt(Vt,1)} m³</b> de ${fmt(VMAX*4,1)} m³<br>V<sub>tanque</sub> = π·${R_T}²·h = ${fmt(VMAX,2)} m³</div>`
+   +'<table class="w-full mt-2 text-xs"><tr class="text-cyan-100/60"><td>Sector</td><td>Nivel</td><td>P (kPa)</td><td>Q<sub>in</sub></td><td>h<sub>f</sub></td></tr>'
+   +TK.map(k=>{const h=k.V/(Math.PI*R_T*R_T);return `<tr class="border-t border-cyan-900"><td>${k.n}</td><td>${fmt(h)} m (${fmt(k.V/VMAX*100,0)}%)</td><td>${fmt(HID.presion(h))}</td><td>${fmt(k.qin)}</td><td>${fmt(k.qin>0?HID.hf(k.qin):0)}</td></tr>`;}).join('')+'</table>';
+  const bajo=TK.filter(k=>k.V/VMAX<.15).map(k=>k.n);
+  $('st').innerHTML=r.qplanta<=0?'<b class="text-red-300">Planta fuera de servicio.</b> Sin agua a los sectores.'
+    :bajo.length?`<b class="text-orange-300">Déficit en:</b> ${bajo.join(', ')}.`:'<span class="text-emerald-300">Suministro estable en todos los sectores.</span>';
+}
+
+/* ===== 5. BUCLE ===== */
+let last=performance.now(),acc=0,T=0;const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
+function loop(now){
+  const dt=Math.min(.1,(now-last)/1000);last=now;T+=dt;const r=step(dt);
+  TK.forEach((k,i)=>{
+    k.water.scale.y=Math.max(.001,k.V/VMAX*TH);
+    const f=flows[i],on=k.qin>0;f.pts.visible=on;
+    if(on){f.ph+=dt*(reduce?.02:.04+k.qin/500);const p=f.pg.attributes.position;
+      for(let j=0;j<NP;j++){const v=f.cv.getPointAt((j/NP+f.ph)%1);p.setXYZ(j,v.x,v.y+.05,v.z);}p.needsUpdate=true;}
+  });
+  if(S.emerg){const p=jg.attributes.position,H0=HID.H0,al=HID.alcance();
+    for(let i=0;i<JN;i++){const s=((T*.7+i/JN)%1)*al,u=s/al;p.setXYZ(i,PX+(jit[i][0])*u*1.1,Math.max(.05,HID.chorro(s,H0)),PZ+2.8+s);}p.needsUpdate=true;
+    splash.scale.setScalar(1+((T*1.4)%1)*1.2);splash.material.opacity=.7-((T*1.4)%1)*.6;
+    gateLight.intensity=1.4+Math.sin(T*8)*.8;gate.material.emissive.set(0xaa2200);
+  }else{gateLight.intensity=0;gate.material.emissive.set(0x000000);}
+  acc+=dt;if(acc>.2){acc=0;ui(r);}
+  cam();renderer.render(scene,camera);requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
