@@ -156,7 +156,7 @@ const splash=new THREE.Mesh(new THREE.RingGeometry(.4,.7,24).rotateX(-Math.PI/2)
 splash.position.set(PX,.08,PZ+2.8+HID.alcance());splash.visible=false;scene.add(splash);
 
 // Cámara orbital
-let th=.12,ph=1.12,rad=50;const tgt=V3(2,4,-4);
+let th=.12,ph=1.35,rad=62;const tgt=V3(2,10,-14);
 const cam=()=>{camera.position.set(tgt.x+rad*Math.sin(ph)*Math.sin(th),tgt.y+rad*Math.cos(ph),tgt.z+rad*Math.sin(ph)*Math.cos(th));camera.lookAt(tgt);};
 let drag=null;const el=renderer.domElement;
 el.addEventListener('pointerdown',e=>{drag=[e.clientX,e.clientY];el.setPointerCapture(e.pointerId);});
